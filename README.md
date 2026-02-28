@@ -6,6 +6,7 @@ Async Python logging handler for [Grafana Loki](https://grafana.com/oss/loki/). 
 
 - **Fully async** -- all HTTP I/O via `aiohttp` with lazy session management
 - **Two handler modes** -- direct (`LokiHandler`) and queue-based (`LokiQueueHandler`) for high-throughput use
+- **Retry with back-off** -- `LokiQueueHandler` retries failed pushes with exponential back-off
 - **Multiple API versions** -- supports both the legacy `/api/prom/push` (v0) and the current push API (v1/v2)
 - **Automatic label sanitization** -- invalid characters are replaced or stripped per Loki's label naming rules
 - **Fast JSON** -- uses `orjson` for serialization
@@ -59,7 +60,9 @@ asyncio.run(main())
 
 ### Queue-based handler (recommended for production)
 
-`LokiQueueHandler` decouples log production from HTTP transmission via an internal `asyncio.Queue` and a background task:
+`LokiQueueHandler` decouples log production from HTTP transmission via an internal `asyncio.Queue` and a background task.
+
+> **Note:** `LokiQueueHandler` must be instantiated inside a running asyncio event loop. Creating it at module level or before `asyncio.run()` will raise `RuntimeError`.
 
 ```python
 import asyncio
@@ -81,7 +84,7 @@ async def main():
     logger.info("Queued log entry")
     logger.warning("This won't block the caller")
 
-    # Clean shutdown: drains the queue and closes the session
+    # Clean shutdown: stops the background task and drains the session
     await handler.aclose()
 
 asyncio.run(main())
@@ -129,6 +132,25 @@ logger.info(
 
 > **Note:** Version `"0"` is deprecated and triggers a `DeprecationWarning`. Use `"1"` or `"2"` for Loki >= 0.4.0.
 
+## Retry Behaviour
+
+`LokiQueueHandler` automatically retries failed pushes (non-204 responses) using exponential back-off. Two parameters control this:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_retries` | `3` | Maximum retry attempts per record. `0` disables retries. |
+| `retry_delay` | `1.0` | Base delay in seconds. Actual wait: `retry_delay * 2 ** n` for attempt `n`. |
+
+With defaults, a failing record is retried after 1 s, 2 s, and 4 s before the handler closes. To disable retries entirely:
+
+```python
+handler = LokiQueueHandler(
+    url="http://localhost:3100/loki/api/v1/push",
+    version="1",
+    max_retries=0,
+)
+```
+
 ## Configuration via `logging.config`
 
 ```python
@@ -142,6 +164,8 @@ LOGGING_CONFIG = {
             "url": "http://localhost:3100/loki/api/v1/push",
             "tags": {"application": "my-service"},
             "version": "1",
+            "max_retries": 3,
+            "retry_delay": 1.0,
         },
     },
     "root": {
@@ -153,6 +177,8 @@ LOGGING_CONFIG = {
 logging.config.dictConfig(LOGGING_CONFIG)
 ```
 
+> **Note:** When using `dictConfig`, the handler is instantiated synchronously during `dictConfig()` call. Ensure an event loop is running at that point (e.g. call `dictConfig` inside an `async` function).
+
 ## Architecture
 
 ```
@@ -161,12 +187,15 @@ aioloki_py/
 ├── constants.py    # Shared constants and label rules
 ├── json.py         # orjson wrapper (str output)
 ├── emitter.py      # HTTP push emitters (BaseLokiEmitter, LokiEmitterV0, LokiEmitter)
-└── handlers.py     # logging.Handler subclasses (LokiHandler, LokiQueueHandler)
+└── handlers.py     # logging.Handler subclasses (BaseHandler, LokiHandler, LokiQueueHandler)
 ```
 
 **Emitters** (`emitter.py`) handle the HTTP transport layer: session lifecycle, authentication, label sanitization, and payload construction. Two implementations target different Loki API versions.
 
-**Handlers** (`handlers.py`) bridge Python's `logging` module with the emitters. `LokiHandler` schedules a send task per record; `LokiQueueHandler` buffers records and processes them sequentially in a background task.
+**Handlers** (`handlers.py`) bridge Python's `logging` module with the emitters. `BaseHandler` owns the emitter instance and provides shared infrastructure (version selection, close/aclose, error handling). Both concrete handlers extend it directly:
+
+- `LokiHandler` — schedules a fire-and-forget async task per record.
+- `LokiQueueHandler` — buffers records in an `asyncio.Queue` and processes them sequentially in a background task with configurable retry.
 
 ## Development
 

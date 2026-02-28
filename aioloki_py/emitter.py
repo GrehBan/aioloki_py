@@ -9,6 +9,7 @@ import abc
 import asyncio
 import functools
 import logging
+import warnings
 import weakref
 from typing import Any, TypeAlias
 
@@ -25,7 +26,7 @@ Auth: TypeAlias = tuple[str, str]  # noqa: UP040
 def _format_label(
     label: str,
     label_replace_with: tuple[tuple[str, str], ...],
-    label_allowed_chars: str
+    label_allowed_chars: str,
 ) -> str:
     """Sanitize a label name for Loki compatibility.
 
@@ -72,39 +73,50 @@ class BaseLokiEmitter(abc.ABC):
         tags: dict[str, str] | None = None,
         auth: Auth | None = None,
         headers: dict[str, Any] | None = None,
-        verify_ssl: bool = True
+        verify_ssl: bool = True,
     ) -> None:
         self.url = url
         self.tags = tags or {}
         self.auth = auth
         self.headers = headers
         self.verify_ssl = verify_ssl
-
+        self._closed: bool = False
         self._session: ClientSession | None = None
-        self._pending_tasks: weakref.WeakSet[
-            asyncio.Task[Any]
-        ] = weakref.WeakSet()
+        self._pending_tasks: weakref.WeakSet[asyncio.Task[Any]] = (
+            weakref.WeakSet()
+        )
+
+    @property
+    def closed(self) -> bool:
+        """Whether the emitter has been closed or its session has closed."""
+        if self._closed:
+            return True
+        return self._session is not None and self._session.closed
 
     @property
     def session(self) -> ClientSession:
         """Return the active ``ClientSession``.
 
+        Returns:
+            The active aiohttp ``ClientSession``.
+
         Raises:
-            RuntimeError: If the session has not been created yet.
+            RuntimeError: If the emitter is closed or not yet initialized.
         """
-        if self._session is None:
-            raise RuntimeError(
-                "Session is not initialized"
-            )
+        if self._closed or self._session is None:
+            raise RuntimeError("Session is not initialized")
         return self._session
 
     async def aclose(self) -> None:
-        """Drain pending tasks and close the HTTP session."""
+        """Drain pending tasks and close the HTTP session.
+
+        Waits up to 1 second for in-flight requests to complete,
+        then closes the aiohttp ``ClientSession`` and clears the
+        session reference so :attr:`closed` returns ``True``.
+        """
+        self._closed = True
         await self._drain()
-        if (
-            self._session is not None
-            and not self._session.closed
-        ):
+        if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
 
@@ -114,11 +126,10 @@ class BaseLokiEmitter(abc.ABC):
         Schedules :meth:`aclose` on the running event loop, or
         falls back to ``asyncio.run()`` if no loop is active.
         """
+        self._closed = True
         aio.force_run(self.aclose())
 
-    async def create_session(
-        self, close: bool = False
-    ) -> ClientSession:
+    async def create_session(self, close: bool = False) -> ClientSession:
         """Return the ``ClientSession``, creating it if needed.
 
         The session is lazily initialized on first call and reused
@@ -133,28 +144,23 @@ class BaseLokiEmitter(abc.ABC):
         if close:
             await self.aclose()
 
-        if (
-            self._session is None
-            or self._session.closed
-        ):
+        if self._session is None or self._session.closed:
             auth = (
-                BasicAuth(
-                    login=self.auth[0],
-                    password=self.auth[1]
-                ) if self.auth else None
+                BasicAuth(login=self.auth[0], password=self.auth[1])
+                if self.auth
+                else None
             )
             self._session = ClientSession(
                 auth=auth,
                 connector=TCPConnector(ssl=self.verify_ssl),
                 headers=self.headers,
-                json_serialize=json.dumps
+                json_serialize=json.dumps,
             )
-        return self._session
+        return self.session
 
     @abc.abstractmethod
     def build_payload(
-        self,
-        record: logging.LogRecord, line: str
+        self, record: logging.LogRecord, line: str
     ) -> dict[str, Any]:
         """Build the JSON payload for a Loki push request.
 
@@ -168,9 +174,7 @@ class BaseLokiEmitter(abc.ABC):
         """
         raise NotImplementedError
 
-    def __call__(
-        self, record: logging.LogRecord, line: str
-    ) -> None:
+    def __call__(self, record: logging.LogRecord, line: str) -> None:
         """Fire-and-forget: schedule a log record send as a task.
 
         The task reference is kept in a ``WeakSet`` to prevent
@@ -200,9 +204,7 @@ class BaseLokiEmitter(abc.ABC):
         except TimeoutError:
             return
 
-    async def send_record(
-        self, record: logging.LogRecord, line: str
-    ) -> None:
+    async def send_record(self, record: logging.LogRecord, line: str) -> None:
         """Send a single log record to Loki.
 
         Args:
@@ -216,10 +218,7 @@ class BaseLokiEmitter(abc.ABC):
 
         payload = self.build_payload(record=record, line=line)
 
-        async with session.post(
-            url=self.url,
-            json=payload
-        ) as response:
+        async with session.post(url=self.url, json=payload) as response:
             if response.status != self.success_response_code:
                 raise ValueError(
                     f"Unexpected Loki API "
@@ -236,14 +235,10 @@ class BaseLokiEmitter(abc.ABC):
             The sanitized label name.
         """
         return _format_label(
-            label,
-            self.label_replace_with,
-            self.label_allowed_chars
+            label, self.label_replace_with, self.label_allowed_chars
         )
 
-    def build_tags(
-        self, record: logging.LogRecord
-    ) -> dict[str, Any]:
+    def build_tags(self, record: logging.LogRecord) -> dict[str, str]:
         """Build the full label set for a log record.
 
         Merges static tags, log level, logger name, and any extra
@@ -261,12 +256,13 @@ class BaseLokiEmitter(abc.ABC):
 
         extra_tags = getattr(record, "tags", {})
         if not isinstance(extra_tags, dict):
+            warnings.warn("Extra tags attribute must be a dict", UserWarning)
             return tags
 
         for tag_name, tag_value in extra_tags.items():
             cleared_name = self.format_label(tag_name)
             if cleared_name:
-                tags[cleared_name] = tag_value
+                tags[cleared_name] = str(tag_value)
 
         return tags
 
@@ -279,9 +275,7 @@ class LokiEmitterV0(BaseLokiEmitter):
     """
 
     def build_payload(
-        self,
-        record: logging.LogRecord,
-        line: str
+        self, record: logging.LogRecord, line: str
     ) -> dict[str, Any]:
         """Build a legacy-format Loki push payload.
 
@@ -314,10 +308,8 @@ class LokiEmitterV0(BaseLokiEmitter):
             A Prometheus-format labels string.
         """
         labels: list[str] = []
-        for label_name, label_value in self.build_tags(
-            record
-        ).items():
-            label_value = str(label_value).replace('"', r"\"")
+        for label_name, label_value in self.build_tags(record).items():
+            label_value = label_value.replace('"', r"\"")
             labels.append(f'{label_name}="{label_value}"')
         return "{{{}}}".format(",".join(labels))
 
@@ -330,9 +322,7 @@ class LokiEmitter(BaseLokiEmitter):
     """
 
     def build_payload(
-        self,
-        record: logging.LogRecord,
-        line: str
+        self, record: logging.LogRecord, line: str
     ) -> dict[str, Any]:
         """Build a current-format Loki push payload.
 
@@ -346,10 +336,7 @@ class LokiEmitter(BaseLokiEmitter):
             ``[timestamp, line]`` pairs.
         """
         labels = self.build_tags(record)
-        ts = str(
-            int(record.created) * 10**9
-            + round((record.created % 1) * 10**9)
-        )
+        ts = str(round(record.created * 10**9))
         stream = {
             "stream": labels,
             "values": [[ts, line]],

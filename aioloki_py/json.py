@@ -19,15 +19,3 @@ def dumps(obj: Any, /) -> str:
         A UTF-8 JSON string.
     """
     return orjson.dumps(obj).decode("utf-8")
-
-
-def loads(s: str, /) -> Any:
-    """Deserialize a JSON string to a Python object.
-
-    Args:
-        s: The JSON string to deserialize.
-
-    Returns:
-        The deserialized Python object.
-    """
-    return orjson.loads(s)

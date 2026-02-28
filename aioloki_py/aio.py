@@ -9,6 +9,10 @@ from collections.abc import Coroutine
 from typing import Any
 
 
+class LoopNotFoundError(RuntimeError):
+    """Raised by :func:`spawn_task` when no event loop is running."""
+
+
 def spawn_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
     """Schedule a coroutine as an asyncio task on the running loop.
 
@@ -19,9 +23,12 @@ def spawn_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         The created asyncio task.
 
     Raises:
-        RuntimeError: If no event loop is currently running.
+        LoopNotFoundError: If no event loop is currently running.
     """
-    return asyncio.get_running_loop().create_task(coro)
+    loop = asyncio._get_running_loop()
+    if loop is None:
+        raise LoopNotFoundError("There is no current event loop")
+    return loop.create_task(coro)
 
 
 def force_run(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any] | None:
@@ -40,7 +47,7 @@ def force_run(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any] | None:
     """
     try:
         return spawn_task(coro)
-    except RuntimeError:
+    except LoopNotFoundError:
         asyncio.run(coro)
 
     return None
