@@ -156,6 +156,8 @@ class BaseLokiEmitter(abc.ABC):
                 headers=self.headers,
                 json_serialize=json.dumps,
             )
+        
+        self._closed = False
         return self.session
 
     @abc.abstractmethod
